@@ -20,6 +20,12 @@
 (define-constant ERR_INVALID_SERIES_PARAMETERS (err u118))
 (define-constant ERR_SERIES_ALREADY_ACTIVE (err u119))
 (define-constant ERR_SERIES_NOT_ACTIVE (err u120))
+(define-constant ERR_INVALID_PRIZE_STRUCTURE (err u121))
+(define-constant ERR_PRIZE_PERCENTAGES_INVALID (err u122))
+(define-constant ERR_TOO_MANY_TIERS (err u123))
+(define-constant ERR_TIER_NOT_FOUND (err u124))
+(define-constant ERR_PRIZES_ALREADY_DISTRIBUTED (err u125))
+(define-constant ERR_INSUFFICIENT_PARTICIPANTS_FOR_TIERS (err u126))
 
 (define-data-var raffle-counter uint u0)
 (define-data-var platform-fee-percentage uint u5)
@@ -105,6 +111,37 @@
 
 (define-map series-subscriber-count
   uint
+  uint
+)
+
+;; Multi-tier prize system maps
+(define-map raffle-prize-structure
+  uint
+  {
+    total-tiers: uint,
+    prizes-distributed: bool,
+    total-prize-pool: uint,
+    platform-fee-deducted: uint
+  }
+)
+
+(define-map prize-tiers
+  { raffle-id: uint, tier: uint }
+  {
+    percentage: uint,
+    prize-amount: uint,
+    winner: (optional principal),
+    is-claimed: bool
+  }
+)
+
+(define-map raffle-winners
+  { raffle-id: uint, position: uint }
+  principal
+)
+
+(define-map winner-positions
+  { raffle-id: uint, winner: principal }
   uint
 )
 
@@ -597,3 +634,249 @@
     false
   )
 )
+
+;; Create a raffle with multi-tier prize structure
+(define-public (create-multi-tier-raffle (title (string-ascii 100)) (description (string-ascii 500)) (entry-fee uint) (duration uint) (max-participants uint) (tier-percentages (list 10 uint)))
+  (let
+    (
+      (raffle-id (+ (var-get raffle-counter) u1))
+      (end-block (+ stacks-block-height duration))
+      (total-tiers (len tier-percentages))
+      (percentage-sum (fold + tier-percentages u0))
+    )
+    ;; Validate inputs
+    (asserts! (> duration u0) ERR_INVALID_DURATION)
+    (asserts! (> max-participants u0) ERR_INVALID_DURATION)
+    (asserts! (and (> total-tiers u0) (<= total-tiers u10)) ERR_TOO_MANY_TIERS)
+    (asserts! (is-eq percentage-sum u100) ERR_PRIZE_PERCENTAGES_INVALID)
+    (asserts! (>= entry-fee u0) ERR_INVALID_ENTRY_FEE)
+    
+    ;; Create the base raffle
+    (map-set raffles raffle-id
+      {
+        creator: tx-sender,
+        title: title,
+        description: description,
+        entry-fee: entry-fee,
+        end-block: end-block,
+        max-participants: max-participants,
+        participant-count: u0,
+        winner: none,
+        prize-pool: u0,
+        is-active: true
+      }
+    )
+    
+    ;; Initialize prize structure
+    (map-set raffle-prize-structure raffle-id
+      {
+        total-tiers: total-tiers,
+        prizes-distributed: false,
+        total-prize-pool: u0,
+        platform-fee-deducted: u0
+      }
+    )
+    
+    ;; Set up prize tiers manually for first 3 tiers
+    (if (> total-tiers u0)
+      (let ((tier-0-percentage (default-to u0 (element-at tier-percentages u0))))
+        (map-set prize-tiers { raffle-id: raffle-id, tier: u0 }
+          { percentage: tier-0-percentage, prize-amount: u0, winner: none, is-claimed: false }))
+      true)
+    
+    (if (> total-tiers u1)
+      (let ((tier-1-percentage (default-to u0 (element-at tier-percentages u1))))
+        (map-set prize-tiers { raffle-id: raffle-id, tier: u1 }
+          { percentage: tier-1-percentage, prize-amount: u0, winner: none, is-claimed: false }))
+      true)
+    
+    (if (> total-tiers u2)
+      (let ((tier-2-percentage (default-to u0 (element-at tier-percentages u2))))
+        (map-set prize-tiers { raffle-id: raffle-id, tier: u2 }
+          { percentage: tier-2-percentage, prize-amount: u0, winner: none, is-claimed: false }))
+      true)
+    
+    (var-set raffle-counter raffle-id)
+    (ok raffle-id)
+  )
+)
+
+;; Distribute prizes to multiple winners
+(define-public (distribute-multi-tier-prizes (raffle-id uint))
+  (let
+    (
+      (raffle (unwrap! (map-get? raffles raffle-id) ERR_RAFFLE_NOT_FOUND))
+      (prize-structure (unwrap! (map-get? raffle-prize-structure raffle-id) ERR_INVALID_PRIZE_STRUCTURE))
+      (current-block stacks-block-height)
+      (participant-count (get participant-count raffle))
+      (total-tiers (get total-tiers prize-structure))
+    )
+    ;; Validate conditions
+    (asserts! (>= current-block (get end-block raffle)) ERR_RAFFLE_NOT_ENDED)
+    (asserts! (> participant-count u0) ERR_NO_PARTICIPANTS)
+    (asserts! (>= participant-count total-tiers) ERR_INSUFFICIENT_PARTICIPANTS_FOR_TIERS)
+    (asserts! (not (get prizes-distributed prize-structure)) ERR_PRIZES_ALREADY_DISTRIBUTED)
+    
+    ;; Calculate platform fee and net prize pool
+    (let
+      (
+        (total-prize-pool (get prize-pool raffle))
+        (platform-fee (/ (* total-prize-pool (var-get platform-fee-percentage)) u100))
+        (net-prize-pool (- total-prize-pool platform-fee))
+      )
+      ;; Transfer platform fee
+      (if (> platform-fee u0)
+        (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
+        true
+      )
+      
+      ;; Select winners and distribute prizes
+      (try! (select-and-distribute-winners raffle-id net-prize-pool total-tiers participant-count))
+      
+      ;; Update prize structure
+      (map-set raffle-prize-structure raffle-id
+        (merge prize-structure {
+          prizes-distributed: true,
+          total-prize-pool: net-prize-pool,
+          platform-fee-deducted: platform-fee
+        })
+      )
+      
+      ;; Mark raffle as inactive
+      (map-set raffles raffle-id
+        (merge raffle { is-active: false })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Select winners and distribute prizes using simple approach
+(define-private (select-and-distribute-winners (raffle-id uint) (net-prize-pool uint) (total-tiers uint) (participant-count uint))
+  (let
+    (
+      (random-base (mod (+ stacks-block-height raffle-id) participant-count))
+    )
+    (distribute-prizes-iteratively raffle-id net-prize-pool total-tiers participant-count random-base)
+  )
+)
+
+;; Distribute prizes to winners iteratively
+(define-private (distribute-prizes-iteratively (raffle-id uint) (net-prize-pool uint) (total-tiers uint) (participant-count uint) (random-base uint))
+  (let
+    (
+      (tier-0-winner-index (mod random-base participant-count))
+      (tier-1-winner-index (mod (+ random-base u7) participant-count))
+      (tier-2-winner-index (mod (+ random-base u17) participant-count))
+    )
+    (if (> total-tiers u0)
+      (try! (distribute-single-prize raffle-id net-prize-pool u0 tier-0-winner-index))
+      true
+    )
+    (if (> total-tiers u1)
+      (try! (distribute-single-prize raffle-id net-prize-pool u1 (if (is-eq tier-1-winner-index tier-0-winner-index) (mod (+ tier-1-winner-index u1) participant-count) tier-1-winner-index)))
+      true
+    )
+    (if (> total-tiers u2)
+      (try! (distribute-single-prize raffle-id net-prize-pool u2 (get-unique-index tier-2-winner-index (list tier-0-winner-index tier-1-winner-index) participant-count)))
+      true
+    )
+    (ok true)
+  )
+)
+
+;; Get unique index that doesn't conflict with existing winners
+(define-private (get-unique-index (candidate-index uint) (used-indices (list 10 uint)) (participant-count uint))
+  (if (is-none (index-of used-indices candidate-index))
+    candidate-index
+    (mod (+ candidate-index u1) participant-count)
+  )
+)
+
+;; Distribute prize for a single tier
+(define-private (distribute-single-prize (raffle-id uint) (net-prize-pool uint) (tier uint) (winner-index uint))
+  (let
+    (
+      (winner-principal (unwrap! (map-get? raffle-participant-list { raffle-id: raffle-id, index: winner-index }) ERR_NO_PARTICIPANTS))
+      (tier-info (unwrap! (map-get? prize-tiers { raffle-id: raffle-id, tier: tier }) ERR_TIER_NOT_FOUND))
+      (prize-amount (/ (* net-prize-pool (get percentage tier-info)) u100))
+    )
+    ;; Record winner
+    (map-set raffle-winners { raffle-id: raffle-id, position: tier } winner-principal)
+    (map-set winner-positions { raffle-id: raffle-id, winner: winner-principal } tier)
+    
+    ;; Update tier info with prize amount and winner
+    (map-set prize-tiers { raffle-id: raffle-id, tier: tier }
+      (merge tier-info {
+        prize-amount: prize-amount,
+        winner: (some winner-principal),
+        is-claimed: false
+      })
+    )
+    
+    ;; Transfer prize to winner
+    (if (> prize-amount u0)
+      (try! (as-contract (stx-transfer? prize-amount tx-sender winner-principal)))
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; Claim prize for a specific tier (alternative to automatic distribution)
+(define-public (claim-tier-prize (raffle-id uint) (tier uint))
+  (let
+    (
+      (tier-info (unwrap! (map-get? prize-tiers { raffle-id: raffle-id, tier: tier }) ERR_TIER_NOT_FOUND))
+      (winner (unwrap! (get winner tier-info) ERR_WINNER_ALREADY_SELECTED))
+    )
+    (asserts! (is-eq tx-sender winner) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-claimed tier-info)) ERR_PRIZES_ALREADY_DISTRIBUTED)
+    (asserts! (> (get prize-amount tier-info) u0) ERR_INSUFFICIENT_PAYMENT)
+    
+    ;; Mark as claimed
+    (map-set prize-tiers { raffle-id: raffle-id, tier: tier }
+      (merge tier-info { is-claimed: true })
+    )
+    
+    ;; Transfer prize
+    (try! (as-contract (stx-transfer? (get prize-amount tier-info) tx-sender winner)))
+    
+    (ok (get prize-amount tier-info))
+  )
+)
+
+;; Read-only functions for multi-tier system
+(define-read-only (get-raffle-prize-structure (raffle-id uint))
+  (map-get? raffle-prize-structure raffle-id)
+)
+
+(define-read-only (get-prize-tier-info (raffle-id uint) (tier uint))
+  (map-get? prize-tiers { raffle-id: raffle-id, tier: tier })
+)
+
+(define-read-only (get-raffle-winner-by-position (raffle-id uint) (position uint))
+  (map-get? raffle-winners { raffle-id: raffle-id, position: position })
+)
+
+(define-read-only (get-winner-position (raffle-id uint) (winner principal))
+  (map-get? winner-positions { raffle-id: raffle-id, winner: winner })
+)
+
+(define-read-only (get-total-prize-tiers (raffle-id uint))
+  (match (map-get? raffle-prize-structure raffle-id)
+    structure (some (get total-tiers structure))
+    none
+  )
+)
+
+(define-read-only (are-prizes-distributed (raffle-id uint))
+  (match (map-get? raffle-prize-structure raffle-id)
+    structure (get prizes-distributed structure)
+    false
+  )
+)
+
+
